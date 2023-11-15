@@ -5,6 +5,8 @@
 *  Dropped python 3.8 support.
 *  Extend GetPipelineRunExecutions, GetPipelineRunArtifacts APIs to support
    filtering by execution create_time, type.
+*  Allow DistributionValidator baseStatistics input channel' artifacts to be
+   empty for cold start of data validation.
 
 ## Breaking Changes
 
