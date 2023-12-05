@@ -22,6 +22,7 @@ from unittest import mock
 
 from absl.testing import parameterized
 import tensorflow as tf
+from tfx.dsl.io import fileio
 from tfx.orchestration import data_types_utils
 from tfx.orchestration import metadata
 from tfx.orchestration.experimental.core import env
@@ -189,6 +190,11 @@ class PipelineIRCodecTest(test_utils.TfxTest):
         'Expected pipeline IR URL to be stored as json.',
     )
 
+  def test_encode_decode_file_not_exist(self):
+    pipeline_encoded = {'pipeline_ir_url': '/fake/file_path'}
+    with self.assertRaises(fileio.NotFoundError):
+      pstate._PipelineIRCodec().decode(json_utils.dumps(pipeline_encoded))
+
 
 class PipelineStateTest(test_utils.TfxTest, parameterized.TestCase):
 
@@ -261,6 +267,24 @@ class PipelineStateTest(test_utils.TfxTest, parameterized.TestCase):
           task_lib.PipelineUid.from_pipeline(pipeline),
           pipeline_state.pipeline_uid,
       )
+
+  @mock.patch.object(pstate, '_get_pipeline_from_orchestrator_execution')
+  def test_load_pipeline_state_with_execution(
+      self, mock_get_pipeline_from_orchestrator_execution
+  ):
+    mock_get_pipeline_from_orchestrator_execution.side_effect = (
+        fileio.NotFoundError()
+    )
+    with self._mlmd_connection as m:
+      pipeline = _test_pipeline('pipeline1', pipeline_nodes=['Trainer'])
+      pstate.PipelineState.new(m, pipeline)
+
+      pipeline_state = pstate.PipelineState.load(
+          m, task_lib.PipelineUid.from_pipeline(pipeline)
+      )
+
+      self.assertIsNotNone(pipeline_state.pipeline_decode_error)
+      self.assertEqual(pipeline_state.pipeline.ByteSize(), 0)
 
   def test_load_all_active_pipeline_state_flag_false(self):
     # no MLMD calls when there _active_pipelines_exist is False.
