@@ -31,6 +31,8 @@ from tfx.types import value_artifact
 from tfx.utils import json_utils
 from tfx.utils import proto_utils
 
+from google.protobuf import any_pb2
+from google.protobuf import descriptor as descriptor_lib
 from google.protobuf import json_format
 from google.protobuf import message
 from google.protobuf import text_format
@@ -375,12 +377,35 @@ class _ExpressionResolver:
   @_register(placeholder_pb2.ListConcatOperator)
   def _resolve_list_concat_operator(
       self, op: placeholder_pb2.ListConcatOperator) -> List[Any]:
+    """Evaluates the list concat operator."""
     result = []
     for sub_expression in op.expressions:
       value = self.resolve(sub_expression)
       if value is None:
         raise NullDereferenceError(sub_expression)
       result.append(value)
+    return result
+
+  @_register(placeholder_pb2.CreateDictOperator)
+  def _resolve_create_dict_operator(
+      self, op: placeholder_pb2.CreateDictOperator
+  ) -> Dict[str, Any]:
+    """Evaluates the create dict operator."""
+    result = {}
+    for entry in op.entries:
+      try:
+        key = self.resolve(entry.key)
+      except NullDereferenceError as e:
+        raise ValueError("A key resolved to None") from e
+      if not isinstance(key, str):
+        raise ValueError(f"Expected string for dict key, got {key!r}.")
+
+      try:
+        value = self.resolve(entry.value)
+        if value is not None:
+          result[key] = value
+      except NullDereferenceError:
+        pass  # Drop None values.
     return result
 
   @_register(placeholder_pb2.ProtoOperator)
@@ -474,9 +499,87 @@ class _ExpressionResolver:
       if op.serialization_format == placeholder_pb2.ProtoOperator.BINARY:
         return value.SerializeToString()
 
-    raise ValueError(
-        "Proto operator resolves to a proto message value. A serialization "
-        "format is needed to render it.")
+    # Otherwise, just return the value as a proto. Note that the top-level
+    # resolve_placeholder_expression() would reject this, but it can be a valid
+    # intermediate value.
+    return value
+
+  def _assign_proto_message(
+      self, out_msg: message.Message, new_value: message.Message
+  ):
+    """Assigns the new_value to the out_msg, even if it's of Any type."""
+    if isinstance(out_msg, any_pb2.Any):
+      out_msg.Pack(new_value)
+    else:
+      out_msg.MergeFrom(new_value)
+
+  @_register(placeholder_pb2.CreateProtoOperator)
+  def _resolve_create_proto_operator(
+      self, op: placeholder_pb2.CreateProtoOperator
+  ) -> message.Message:
+    """Evaluates the create proto operator."""
+    pool = proto_utils.get_pool_with_descriptors(op.file_descriptors)
+    # Start with the base proto.
+    result = proto_utils.unpack_proto_any(op.base, pool)
+    # Then pile all the fields on top.
+    for key, value in op.fields.items():
+      descriptor = result.DESCRIPTOR.fields_by_name[key]
+      field_name = f"{result.DESCRIPTOR.full_name}.{key}"
+      # First resolve the placeholder value of the field.
+      try:
+        value = self.resolve(value)
+      except NullDereferenceError:
+        value = None
+      except Exception as e:
+        raise ValueError(f"Failed to resolve field {field_name}") from e
+
+      # Drop fields that evaluate to None.
+      if value is None:
+        if descriptor.label == descriptor_lib.FieldDescriptor.LABEL_REQUIRED:
+          raise ValueError(
+              f"Placeholder for required field {field_name} resolved to None."
+          )
+        continue
+
+      # Then write the resolved value into the output proto.
+      if (  # If it's a map<> field.
+          descriptor.message_type
+          and descriptor.message_type.has_options
+          and descriptor.message_type.GetOptions().map_entry
+      ):
+        if not isinstance(value, dict):
+          raise ValueError(
+              f"Expected dict value for field {field_name}, but the "
+              f"placeholder resolved to {value!r}"
+          )
+        out_dict = getattr(result, key)
+        for k, v in value.items():
+          if isinstance(v, message.Message):
+            self._assign_proto_message(out_dict[k], v)
+          elif value is not None:
+            out_dict[k] = v
+      elif descriptor.label == descriptor_lib.FieldDescriptor.LABEL_REPEATED:
+        if not isinstance(value, list):
+          raise ValueError(
+              f"Expected list value for field {field_name}, but the placeholder"
+              f" resolved to {value!r}"
+          )
+        out_list = getattr(result, key)
+        for item in value:
+          if isinstance(item, message.Message):
+            self._assign_proto_message(out_list.add(), item)
+          elif value is not None:
+            out_list.append(item)
+      elif descriptor.type == descriptor_lib.FieldDescriptor.TYPE_MESSAGE:
+        self._assign_proto_message(getattr(result, key), value)
+      elif descriptor.type == descriptor_lib.FieldDescriptor.TYPE_ENUM:
+        if isinstance(value, str):
+          value = descriptor.enum_type.values_by_name[value].number
+        setattr(result, key, value)
+      else:
+        setattr(result, key, value)
+
+    return result
 
   @_register(placeholder_pb2.ComparisonOperator)
   def _resolve_comparison_operator(
@@ -647,6 +750,20 @@ def debug_str(expression: placeholder_pb2.PlaceholderExpression) -> str:
       expression_str = ", ".join(debug_str(e) for e in operator_pb.expressions)
       return f"to_list([{expression_str}])"
 
+    if operator_name == "create_dict_op":
+      expression_str = ", ".join(
+          f"{debug_str(entry.key)}={debug_str(entry.value)}"
+          for entry in operator_pb.entries
+      )
+      return f"to_dict({{{expression_str}}})"
+
+    if operator_name == "create_proto_op":
+      expression_str = ", ".join(
+          f"{field_name}={debug_str(field_value)}"
+          for field_name, field_value in sorted(operator_pb.fields.items())
+      )
+      return f"CreateProto({str(operator_pb.base).strip()}, {expression_str})"
+
     return "Unknown placeholder operator"
 
   return "Unknown placeholder expression"
@@ -701,21 +818,23 @@ def get_all_types_in_placeholder_expression(
     operator_name = placeholder.operator.WhichOneof("operator_type")
     operator_pb = getattr(placeholder.operator, operator_name)
 
-    # Unary operators.
     if operator_name in get_unary_operator_names():
-      return get_all_types_in_placeholder_expression(operator_pb.expression)
+      expressions = [operator_pb.expression]
+    elif operator_name in get_binary_operator_names():
+      expressions = [operator_pb.lhs, operator_pb.rhs]
+    elif operator_name in get_nary_operator_names():
+      expressions = operator_pb.expressions
+    elif operator_name == "create_proto_op":
+      expressions = operator_pb.fields.values()
+    else:
+      raise ValueError(
+          f"Unrecognized placeholder operator {operator_name} in expression: "
+          f"{placeholder}"
+      )
 
-    # Binary operators.
-    if operator_name in get_binary_operator_names():
-      return get_all_types_in_placeholder_expression(
-          operator_pb.lhs
-      ) | get_all_types_in_placeholder_expression(operator_pb.rhs)
-
-    # N-ary operators.
-    if operator_name in get_nary_operator_names():
-      types = set()
-      for expression in operator_pb.expressions:
-        types |= get_all_types_in_placeholder_expression(expression)
-      return types
+    types = set()
+    for expression in expressions:
+      types |= get_all_types_in_placeholder_expression(expression)
+    return types
 
   raise ValueError(f"Unrecognized placeholder expression: {placeholder}")
