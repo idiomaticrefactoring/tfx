@@ -558,6 +558,7 @@ def _set_node_execution_options(
     options_proto.node_success_optional = options_py.success_optional
     options_proto.max_execution_retries = options_py.max_execution_retries
     options_proto.execution_timeout_sec = options_py.execution_timeout_sec
+    options_proto.run_mode = options_py._run_mode  # pylint: disable=protected-access
     options_proto.reset_stateful_working_dir = (
         options_py.reset_stateful_working_dir
     )
