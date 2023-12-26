@@ -22,6 +22,8 @@ from absl.testing import parameterized
 from tensorflow_data_validation.anomalies.proto import custom_validation_config_pb2
 from tfx.components.distribution_validator import executor
 from tfx.dsl.io import fileio
+from tfx.orchestration.experimental.core import component_generated_alert_pb2
+from tfx.orchestration.experimental.core import constants
 from tfx.proto import distribution_validator_pb2
 from tfx.types import artifact_utils
 from tfx.types import standard_artifacts
@@ -213,6 +215,57 @@ class ExecutorTest(parameterized.TestCase, test_case_utils.TfxTest):
         }
           """,
           'anomalies_blessed_value': 0,
+          'expected_alerts': (
+              component_generated_alert_pb2.ComponentGeneratedAlertList(
+                  component_generated_alert_list=[
+                      component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+                          alert_name=(
+                              'Drift detected for split pair train_eval.'),
+                          alert_body=(
+                              'Drift measurement type: L_INFTY, value: '
+                              '0.012277129468474923, threshold: 0.0. Split '
+                              'pair: train_eval.'
+                          ),
+                      ),
+                      component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+                          alert_name=(
+                              'Drift detected for split pair train_eval.'),
+                          alert_body=(
+                              'Drift measurement type: '
+                              'JENSEN_SHANNON_DIVERGENCE, value: '
+                              '0.000917362998174601, threshold: 0.0. Split '
+                              'pair: train_eval.'
+                          ),
+                      ),
+                      component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+                          alert_name=(
+                              'High approximate Jensen-Shannon divergence '
+                              'between current and previous for split pair: '
+                              'train_eval.'
+                          ),
+                          alert_body=(
+                              'The approximate Jensen-Shannon divergence '
+                              'between current and previous is 0.000917363 (up '
+                              'to six significant digits), above the threshold '
+                              '0. for split pair: train_eval.'
+                          ),
+                      ),
+                      component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+                          alert_name=(
+                              'High Linfty distance between current and '
+                              'previous for split pair: train_eval.'
+                          ),
+                          alert_body=(
+                              'The Linfty distance between current and '
+                              'previous is 0.0122771 (up to six significant '
+                              'digits), above the threshold 0. The feature '
+                              'value with maximum difference is: Dispatch Taxi '
+                              'Affiliation for split pair: train_eval.'
+                          ),
+                      ),
+                  ]
+              )
+          )
       },
       {
           'testcase_name': 'dataset_constraint',
@@ -236,6 +289,24 @@ class ExecutorTest(parameterized.TestCase, test_case_utils.TfxTest):
                   }
                 }""",
           'anomalies_blessed_value': 0,
+          'expected_alerts': (
+              component_generated_alert_pb2.ComponentGeneratedAlertList(
+                  component_generated_alert_list=[
+                      component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+                          alert_name=(
+                              'High num examples in current dataset versus the '
+                              'previous span. for split pair: train_eval.'
+                          ),
+                          alert_body=(
+                              'The ratio of num examples in the current '
+                              'dataset versus the previous span is 2.02094 (up '
+                              'to six significant digits), which is above the '
+                              'threshold 1. for split pair: train_eval.'
+                          ),
+                      ),
+                  ]
+              )
+          )
       },
       {
           'testcase_name': 'no_anomalies',
@@ -268,6 +339,22 @@ class ExecutorTest(parameterized.TestCase, test_case_utils.TfxTest):
         }
           """,
           'anomalies_blessed_value': 1,
+          'expected_alerts': (
+              component_generated_alert_pb2.ComponentGeneratedAlertList(
+                  component_generated_alert_list=[
+                      component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+                          alert_name=(
+                              'Drift detected for split pair train_eval.'
+                          ),
+                          alert_body=(
+                              'Drift measurement type: L_INFTY, value: '
+                              '0.012277129468474923, threshold: 0.99. '
+                              'Split pair: train_eval.'
+                          ),
+                      ),
+                  ]
+              )
+          )
       },
       {
           'testcase_name': 'custom_anomalies',
@@ -327,6 +414,35 @@ class ExecutorTest(parameterized.TestCase, test_case_utils.TfxTest):
         }
           """,
           'anomalies_blessed_value': 0,
+          'expected_alerts': (
+              component_generated_alert_pb2.ComponentGeneratedAlertList(
+                  component_generated_alert_list=[
+                      component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+                          alert_name=(
+                              'Drift detected for split pair train_eval.'
+                          ),
+                          alert_body=(
+                              'Drift measurement type: L_INFTY, value: '
+                              '0.012277129468474923, threshold: 0.99. '
+                              'Split pair: train_eval.'
+                          ),
+                      ),
+                      component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+                          alert_name=(
+                              'Test feature has too few unique values. for '
+                              'split pair: train_eval.'
+                          ),
+                          alert_body=(
+                              'Custom validation triggered anomaly. Query: '
+                              'feature_test.string_stats.unique > '
+                              'feature_base.string_stats.unique Test dataset: '
+                              'default slice Base dataset:  Base path: '
+                              'company for split pair: train_eval.'
+                          ),
+                      )
+                  ]
+              )
+          )
       },
   )
   def testAnomaliesGenerated(
@@ -335,6 +451,7 @@ class ExecutorTest(parameterized.TestCase, test_case_utils.TfxTest):
       custom_validation_config,
       expected_anomalies,
       anomalies_blessed_value,
+      expected_alerts,
   ):
     source_data_dir = os.path.join(
         os.path.dirname(os.path.dirname(__file__)), 'testdata')
@@ -379,7 +496,9 @@ class ExecutorTest(parameterized.TestCase, test_case_utils.TfxTest):
     }
 
     distribution_validator_executor = executor.Executor()
-    distribution_validator_executor.Do(input_dict, output_dict, exec_properties)
+    executor_output = distribution_validator_executor.Do(
+        input_dict, output_dict, exec_properties
+    )
 
     self.assertEqual(
         artifact_utils.encode_split_names(['train_eval']),
@@ -404,6 +523,15 @@ class ExecutorTest(parameterized.TestCase, test_case_utils.TfxTest):
         ),
         {'train_eval': anomalies_blessed_value},
     )
+
+    actual_alerts = (
+        component_generated_alert_pb2.ComponentGeneratedAlertList()
+    )
+    executor_output.execution_properties[
+        constants.COMPONENT_GENERATED_ALERTS_KEY
+    ].proto_value.Unpack(actual_alerts)
+    for alert in expected_alerts.component_generated_alert_list:
+      self.assertIn(alert, actual_alerts.component_generated_alert_list)
 
   def testStructData(self):
     source_data_dir = FLAGS.test_tmpdir
@@ -534,6 +662,26 @@ class ExecutorTest(parameterized.TestCase, test_case_utils.TfxTest):
         }
       }""", anomalies_pb2.Anomalies())
 
+    expected_alerts = component_generated_alert_pb2.ComponentGeneratedAlertList(
+        component_generated_alert_list=[
+            component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+                alert_name='Drift detected for split pair train_eval.',
+                alert_body=(
+                    'Drift measurement type: JENSEN_SHANNON_DIVERGENCE, value: '
+                    '1.0, threshold: 0.0. Split pair: train_eval.'),
+            ),
+            component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+                alert_name=(
+                    'High approximate Jensen-Shannon divergence between '
+                    'current and previous for split pair: train_eval.'),
+                alert_body=(
+                    'The approximate Jensen-Shannon divergence between current '
+                    'and previous is 1 (up to six significant digits), above '
+                    'the threshold 0. for split pair: train_eval.'),
+            )
+        ],
+    )
+
     # Create stats artifacts with a struct feature.
     for split_dir in ['Split-eval', 'Split-train']:
       full_split_dir = os.path.join(stats_artifact.uri, split_dir)
@@ -572,7 +720,9 @@ class ExecutorTest(parameterized.TestCase, test_case_utils.TfxTest):
     }
 
     distribution_validator_executor = executor.Executor()
-    distribution_validator_executor.Do(input_dict, output_dict, exec_properties)
+    executor_output = distribution_validator_executor.Do(
+        input_dict, output_dict, exec_properties
+    )
 
     self.assertEqual(
         artifact_utils.encode_split_names(['train_eval']),
@@ -588,6 +738,14 @@ class ExecutorTest(parameterized.TestCase, test_case_utils.TfxTest):
     distribution_anomalies = anomalies_pb2.Anomalies()
     distribution_anomalies.ParseFromString(distribution_anomalies_bytes)
     self.assertEqualExceptBaseline(expected_anomalies, distribution_anomalies)
+
+    actual_alerts = (
+        component_generated_alert_pb2.ComponentGeneratedAlertList()
+    )
+    executor_output.execution_properties[
+        constants.COMPONENT_GENERATED_ALERTS_KEY
+    ].proto_value.Unpack(actual_alerts)
+    self.assertEqual(actual_alerts, expected_alerts)
 
   @parameterized.named_parameters(
       {
@@ -904,24 +1062,51 @@ class ExecutorTest(parameterized.TestCase, test_case_utils.TfxTest):
     }
 
     distribution_validator_executor = executor.Executor()
-    distribution_validator_executor.Do(input_dict, output_dict, exec_properties)
+    executor_output = distribution_validator_executor.Do(
+        input_dict, output_dict, exec_properties
+    )
 
     self.assertEqual(
         artifact_utils.encode_split_names(['train_eval']),
         validation_output.split_names,
     )
 
-    expected_anomalies = text_format.Parse(expected_anomalies,
-                                           anomalies_pb2.Anomalies())
+    expected_anomalies = text_format.Parse(
+        expected_anomalies, anomalies_pb2.Anomalies()
+    )
     distribution_anomalies_path = os.path.join(
         validation_output.uri, 'SplitPair-train_eval', 'SchemaDiff.pb'
     )
     self.assertTrue(fileio.exists(distribution_anomalies_path))
     distribution_anomalies_bytes = io_utils.read_bytes_file(
-        distribution_anomalies_path)
+        distribution_anomalies_path
+    )
     distribution_anomalies = anomalies_pb2.Anomalies()
     distribution_anomalies.ParseFromString(distribution_anomalies_bytes)
     self.assertEqualExceptBaseline(expected_anomalies, distribution_anomalies)
+
+    expected_alerts = component_generated_alert_pb2.ComponentGeneratedAlertList(
+        component_generated_alert_list=[
+            component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+                alert_name=(
+                    'Comparison could not be done. for split pair: train_eval.'
+                ),
+                alert_body=(
+                    'Validation could not be done, which could be due to '
+                    'missing data, use of a comparator that is not suitable '
+                    'for the feature type, or some other reason. for split '
+                    'pair: train_eval.'
+                ),
+            ),
+        ]
+    )
+    actual_alerts = (
+        component_generated_alert_pb2.ComponentGeneratedAlertList()
+    )
+    executor_output.execution_properties[
+        constants.COMPONENT_GENERATED_ALERTS_KEY
+    ].proto_value.Unpack(actual_alerts)
+    self.assertEqual(actual_alerts, expected_alerts)
 
   def testAddOutput(self):
     source_data_dir = os.path.join(
@@ -986,12 +1171,37 @@ class ExecutorTest(parameterized.TestCase, test_case_utils.TfxTest):
     }
 
     distribution_validator_executor = executor.Executor()
-    distribution_validator_executor.Do(input_dict, output_dict, exec_properties)
+    executor_output = distribution_validator_executor.Do(
+        input_dict, output_dict, exec_properties
+    )
 
     distribution_anomalies_path = os.path.join(
         anomalies_output.uri, 'SplitPair-train_eval', 'SchemaDiff.pb'
     )
     self.assertTrue(fileio.exists(distribution_anomalies_path))
+
+    expected_alerts = component_generated_alert_pb2.ComponentGeneratedAlertList(
+        component_generated_alert_list=[
+            component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+                alert_name=(
+                    'Comparison could not be done. for split pair: train_eval.'
+                ),
+                alert_body=(
+                    'Validation could not be done, which could be due to '
+                    'missing data, use of a comparator that is not suitable '
+                    'for the feature type, or some other reason. for split '
+                    'pair: train_eval.'
+                ),
+            ),
+        ]
+    )
+    actual_alerts = (
+        component_generated_alert_pb2.ComponentGeneratedAlertList()
+    )
+    executor_output.execution_properties[
+        constants.COMPONENT_GENERATED_ALERTS_KEY
+    ].proto_value.Unpack(actual_alerts)
+    self.assertEqual(actual_alerts, expected_alerts)
 
 
 if __name__ == '__main__':

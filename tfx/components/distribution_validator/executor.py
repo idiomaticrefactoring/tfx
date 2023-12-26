@@ -23,13 +23,17 @@ from tensorflow_data_validation.utils import schema_util
 from tfx import types
 from tfx.components.statistics_gen import stats_artifact_utils
 from tfx.dsl.components.base import base_executor
+from tfx.orchestration.experimental.core import component_generated_alert_pb2
+from tfx.orchestration.experimental.core import constants
 from tfx.proto import distribution_validator_pb2
+from tfx.proto.orchestration import execution_result_pb2
 from tfx.types import artifact_utils
 from tfx.types import standard_component_specs
 from tfx.utils import json_utils
 from tfx.utils import monitoring_utils
 from tfx.utils import writer_utils
 
+from google.protobuf import any_pb2
 from tensorflow_metadata.proto.v0 import anomalies_pb2
 from tensorflow_metadata.proto.v0 import schema_pb2
 from tensorflow_metadata.proto.v0 import statistics_pb2
@@ -170,6 +174,67 @@ def _add_anomalies_for_missing_comparisons(
   return anomalies
 
 
+def _create_anomalies_alerts(
+    anomalies: anomalies_pb2.Anomalies,
+    split_pair: str,
+) -> list[component_generated_alert_pb2.ComponentGeneratedAlertInfo]:
+  """Creates an alert for each anomaly in the anomalies artifact."""
+  result = []
+  # Information about drift and/or skew of the data in the split pair.
+  for info in anomalies.drift_skew_info:
+    for measurement in info.drift_measurements:
+      measurement_type = (
+          anomalies_pb2.DriftSkewInfo.Measurement.Type.Name(measurement.type)
+      )
+      result.append(
+          component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+              alert_name=f'Drift detected for split pair {split_pair}.',
+              alert_body=(
+                  f'Drift measurement type: {measurement_type}, value: '
+                  f'{measurement.value}, threshold: {measurement.threshold}. '
+                  f'Split pair: {split_pair}.'),
+          )
+      )
+    for measurement in info.skew_measurements:
+      measurement_type = (
+          anomalies_pb2.DriftSkewInfo.Measurement.Type.Name(measurement.type)
+      )
+      result.append(
+          component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+              alert_name=f'Skew detected for split pair {split_pair}.',
+              alert_body=(
+                  f'Skew measurement type: {measurement_type}, value: '
+                  f'{measurement.value}, threshold: {measurement.threshold}. '
+                  f'Split pair: {split_pair}.'),
+          )
+      )
+  # Information about dataset-level anomalies, such as "High num examples in
+  # current dataset versus the previous span."
+  if anomalies.HasField('dataset_anomaly_info'):
+    for reason in anomalies.dataset_anomaly_info.reason:
+      result.append(
+          component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+              alert_name=(
+                  f'{reason.short_description} for split pair: {split_pair}.'
+              ),
+              alert_body=f'{reason.description} for split pair: {split_pair}.',
+          )
+      )
+  # Information about feature-level anomalies, such as "High Linfty distance
+  # between current and previous."
+  for _, info in anomalies.anomaly_info.items():
+    for reason in info.reason:
+      result.append(
+          component_generated_alert_pb2.ComponentGeneratedAlertInfo(
+              alert_name=(
+                  f'{reason.short_description} for split pair: {split_pair}.'
+              ),
+              alert_body=f'{reason.description} for split pair: {split_pair}.',
+          )
+      )
+  return result
+
+
 class Executor(base_executor.BaseExecutor):
   """DistributionValidator component executor."""
 
@@ -178,7 +243,7 @@ class Executor(base_executor.BaseExecutor):
       input_dict: Dict[str, List[types.Artifact]],
       output_dict: Dict[str, List[types.Artifact]],
       exec_properties: Dict[str, Any],
-  ) -> None:
+  ) -> execution_result_pb2.ExecutorOutput:
     """DistributionValidator executor entrypoint.
 
     This checks for changes in data distributions from one dataset to another,
@@ -190,7 +255,8 @@ class Executor(base_executor.BaseExecutor):
       exec_properties: A dict of execution properties.
 
     Returns:
-      None
+      ExecutionResult proto with anomalies and the component generated alerts
+      execution property set with anomalies alerts, if any.
     """
     self._log_startup(input_dict, output_dict, exec_properties)
 
@@ -270,6 +336,7 @@ class Executor(base_executor.BaseExecutor):
       )
     current_stats_span = test_statistics.span
     blessed_value_dict = {}
+    alerts = component_generated_alert_pb2.ComponentGeneratedAlertList()
     for test_split, baseline_split in split_pairs:
       split_pair = '%s_%s' % (test_split, baseline_split)
       logging.info('Processing split pair %s', split_pair)
@@ -312,8 +379,28 @@ class Executor(base_executor.BaseExecutor):
           current_stats_span,
           validation_metrics_artifact,
       )
+      alerts.component_generated_alert_list.extend(
+          _create_anomalies_alerts(anomalies, split_pair)
+      )
+      logging.info('Anomalies alerts created for split pair %s.', split_pair)
 
     # Set blessed custom property for Anomalies Artifact
     anomalies_artifact.set_json_value_custom_property(
         ARTIFACT_PROPERTY_BLESSED_KEY, blessed_value_dict
     )
+
+    executor_output = execution_result_pb2.ExecutorOutput()
+    executor_output.output_artifacts[
+        standard_component_specs.ANOMALIES_KEY
+        ].artifacts.append(anomalies_artifact.mlmd_artifact)
+
+    # Set component generated alerts execution property in ExecutorOutput if
+    # any anomalies alerts exist.
+    if alerts.component_generated_alert_list:
+      any_proto = any_pb2.Any()
+      any_proto.Pack(alerts)
+      executor_output.execution_properties[
+          constants.COMPONENT_GENERATED_ALERTS_KEY
+      ].proto_value.CopyFrom(any_proto)
+
+    return executor_output
